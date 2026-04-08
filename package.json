@@ -1,0 +1,22 @@
+{
+  "name": "4data-stream-bridge",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "replay:test": "node replay-test.js",
+    "fixtures:capture": "node capture-fixtures.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "eventsource": "^4.1.0",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.2"
+  }
+}
