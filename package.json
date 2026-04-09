@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "watch": "node watch-alerts.js",
+    "health": "node health-check.js",
     "replay:test": "node replay-test.js",
     "fixtures:capture": "node capture-fixtures.js"
   },

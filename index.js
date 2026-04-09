@@ -1,5 +1,7 @@
 import express from "express";
 import { EventSource } from "eventsource";
+import fs from "node:fs";
+import path from "node:path";
 import {
   deriveSignalFromSseMessage,
   INTERPRETER_VERSION,
@@ -7,13 +9,80 @@ import {
   SIGNAL_CONTRACT_FIELDS,
 } from "./interpreter.js";
 
-const V1_STREAM_URL = "http://localhost:3000/stream";
-const PORT = 3100;
+function loadDotEnv() {
+  const envPath = path.join(process.cwd(), ".env");
+  if (!fs.existsSync(envPath)) return;
+  const raw = fs.readFileSync(envPath, "utf8");
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    if (!(key in process.env)) process.env[key] = val;
+  }
+}
+
+function numEnv(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function boolEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null) return fallback;
+  return ["1", "true", "yes", "on"].includes(String(raw).toLowerCase());
+}
+
+loadDotEnv();
+
+const V1_STREAM_URL = process.env.V1_STREAM_URL || "http://localhost:3000/stream";
+const PORT = numEnv("PORT", 3100);
+const MAX_EVENTS = numEnv("MAX_EVENTS", 200);
+const RECONNECT_BASE_MS = numEnv("SSE_RECONNECT_BASE_MS", 2000);
+const RECONNECT_MAX_MS = numEnv("SSE_RECONNECT_MAX_MS", 60000);
+const DRAIN_ON_SHUTDOWN = boolEnv("BRIDGE_DRAIN_ON_SHUTDOWN", false);
+const DRAIN_FILE_PATH = process.env.BRIDGE_DRAIN_FILE || "";
 
 // ---- In-memory ring buffer ----
-const MAX_EVENTS = 200;
 const events = [];
 let seq = 0;
+const signalSubscribers = new Set();
+
+function mapEventToApiSignal(e) {
+  return {
+    id: e.id,
+    receivedAt: e.receivedAt,
+    lane: e.signal?.lane ?? "unknown",
+    confidence: e.signal?.confidence ?? 0,
+    observed_fact: e.signal?.observed_fact ?? null,
+    source: e.signal?.source ?? "unknown",
+    entity: e.signal?.entity ?? null,
+    location: e.signal?.location ?? null,
+    change: e.signal?.change ?? null,
+    source_class: e.signal?.source_class ?? "external_stream",
+    ambiguous: !!e.signal?.ambiguous,
+    needs_review: !!e.signal?.needs_review,
+    review_reason: e.signal?.review_reason ?? null,
+    signal: e.signal?.lane ?? "unknown",
+    raw: e.signal?.raw ?? e.data ?? null,
+    payload: e.signal?.payload ?? null,
+  };
+}
+
+function broadcastSignal(entry) {
+  if (!signalSubscribers.size) return;
+  const payload = mapEventToApiSignal(entry);
+  const body = JSON.stringify(payload);
+  for (const send of signalSubscribers) {
+    try {
+      send(payload.id, body);
+    } catch {
+      // Ignore dead subscribers; close handler removes them.
+    }
+  }
+}
 
 function recordEvent(evt) {
   const entry = {
@@ -23,18 +92,44 @@ function recordEvent(evt) {
   };
   events.push(entry);
   while (events.length > MAX_EVENTS) events.shift();
+  if (entry.type === "sse_message" && entry.signal) {
+    broadcastSignal(entry);
+  }
   return entry;
 }
 
 // ---- SSE connection ----
 let sseConnected = false;
 let lastEventAt = null;
+let reconnectDelayMs = RECONNECT_BASE_MS;
+let reconnectTimer = null;
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const waitMs = reconnectDelayMs;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToV1();
+  }, waitMs);
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
+  recordEvent({ type: "bridge_reconnect_scheduled", waitMs });
+}
+
+function processIncomingSse(data) {
+  lastEventAt = new Date().toISOString();
+  recordEvent({
+    type: "sse_message",
+    data,
+    signal: deriveSignalFromSseMessage(data),
+  });
+}
 
 function connectToV1() {
   const es = new EventSource(V1_STREAM_URL);
 
   es.onopen = () => {
     sseConnected = true;
+    reconnectDelayMs = RECONNECT_BASE_MS;
     recordEvent({ type: "bridge_connected" });
   };
 
@@ -42,34 +137,19 @@ function connectToV1() {
     sseConnected = false;
     recordEvent({ type: "bridge_disconnected" });
     es.close();
-    setTimeout(connectToV1, 2000);
+    scheduleReconnect();
   };
 
   // Generic message handler (for events without explicit event: field)
   es.onmessage = (msg) => {
-    lastEventAt = new Date().toISOString();
-    const data = msg.data;
-
-    const signal = deriveSignalFromSseMessage(data);
-
-    recordEvent({
-      type: "sse_message",
-      data,
-      signal,
-    });
+    processIncomingSse(msg.data);
   };
 
   // Specific event handlers for v1's named events
   es.addEventListener("hello", (msg) => {
     try {
       console.log("[hello event] received");
-      lastEventAt = new Date().toISOString();
-      const data = msg.data;
-      recordEvent({
-        type: "sse_message",
-        data,
-        signal: deriveSignalFromSseMessage(data),
-      });
+      processIncomingSse(msg.data);
       console.log("[hello event] processed");
     } catch (err) {
       console.error("[hello event] ERROR:", err);
@@ -79,13 +159,7 @@ function connectToV1() {
   es.addEventListener("state_update", (msg) => {
     try {
       console.log("[state_update event] received");
-      lastEventAt = new Date().toISOString();
-      const data = msg.data;
-      recordEvent({
-        type: "sse_message",
-        data,
-        signal: deriveSignalFromSseMessage(data),
-      });
+      processIncomingSse(msg.data);
       console.log("[state_update event] processed");
     } catch (err) {
       console.error("[state_update event] ERROR:", err);
@@ -95,13 +169,7 @@ function connectToV1() {
   es.addEventListener("state_expired", (msg) => {
     try {
       console.log("[state_expired event] received");
-      lastEventAt = new Date().toISOString();
-      const data = msg.data;
-      recordEvent({
-        type: "sse_message",
-        data,
-        signal: deriveSignalFromSseMessage(data),
-      });
+      processIncomingSse(msg.data);
       console.log("[state_expired event] processed");
     } catch (err) {
       console.error("[state_expired event] ERROR:", err);
@@ -125,6 +193,12 @@ app.get("/health", (_req, res) => {
     uptimeSeconds: Math.floor(process.uptime()),
     v1StreamUrl: V1_STREAM_URL,
     bridgePort: PORT,
+    maxEvents: MAX_EVENTS,
+    reconnectBaseMs: RECONNECT_BASE_MS,
+    reconnectMaxMs: RECONNECT_MAX_MS,
+    reconnectNextMs: reconnectDelayMs,
+    drainOnShutdown: DRAIN_ON_SHUTDOWN,
+    drainFilePath: DRAIN_FILE_PATH || null,
     interpreterVersion: INTERPRETER_VERSION,
     laneOntology: LANE_ONTOLOGY,
     signalContractFields: SIGNAL_CONTRACT_FIELDS,
@@ -168,29 +242,32 @@ app.get("/signals", (req, res) => {
 
   const sliced = filtered.slice(-limit);
 
-  const signals = sliced.map((e) => ({
-    id: e.id,
-    receivedAt: e.receivedAt,
-    lane: e.signal?.lane ?? "unknown",
-    confidence: e.signal?.confidence ?? 0,
-    observed_fact: e.signal?.observed_fact ?? null,
-    source: e.signal?.source ?? "unknown",
-    entity: e.signal?.entity ?? null,
-    location: e.signal?.location ?? null,
-    change: e.signal?.change ?? null,
-    source_class: e.signal?.source_class ?? "external_stream",
-    ambiguous: !!e.signal?.ambiguous,
-    needs_review: !!e.signal?.needs_review,
-    review_reason: e.signal?.review_reason ?? null,
-    signal: e.signal?.lane ?? "unknown",
-    raw: e.signal?.raw ?? e.data ?? null,
-    payload: e.signal?.payload ?? null,
-  }));
+  const signals = sliced.map(mapEventToApiSignal);
 
   res.json({
     count: signals.length,
     latestId: events.length ? events[events.length - 1].id : 0,
     signals,
+  });
+});
+
+// Push adapter: re-broadcast derived signals as SSE so consumers can subscribe.
+app.get("/signals/stream", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  res.write("retry: 1000\n\n");
+
+  const send = (id, body) => {
+    res.write("id: " + id + "\n");
+    res.write("event: signal\n");
+    res.write("data: " + body + "\n\n");
+  };
+
+  signalSubscribers.add(send);
+  req.on("close", () => {
+    signalSubscribers.delete(send);
   });
 });
 
@@ -352,7 +429,31 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('[FATAL] Unhandled rejection at:', promise, 'reason:', reason);
 });
 
-app.listen(PORT, () => {
+function drainEventsToFile(reason) {
+  if (!DRAIN_ON_SHUTDOWN || !DRAIN_FILE_PATH) return;
+  try {
+    fs.mkdirSync(path.dirname(DRAIN_FILE_PATH), { recursive: true });
+    fs.writeFileSync(
+      DRAIN_FILE_PATH,
+      JSON.stringify(
+        {
+          reason,
+          drainedAt: new Date().toISOString(),
+          count: events.length,
+          events,
+        },
+        null,
+        2
+      ) + "\n",
+      "utf8"
+    );
+    console.log("[drain] wrote " + events.length + " events to " + DRAIN_FILE_PATH);
+  } catch (err) {
+    console.error("[drain] failed:", err);
+  }
+}
+
+const server = app.listen(PORT, () => {
   console.log("[bridge] listening on port " + PORT);
   try {
     connectToV1();
@@ -360,3 +461,18 @@ app.listen(PORT, () => {
     console.error("[ERROR] Failed to connect to v1:", err);
   }
 });
+
+let shuttingDown = false;
+function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  drainEventsToFile(reason);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  server.close(() => {
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 1000).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

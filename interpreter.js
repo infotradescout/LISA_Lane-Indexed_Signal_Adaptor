@@ -71,17 +71,66 @@ export function classifyLane(normalized) {
 
   if (!combined.trim()) return { lane: "unclassified", confidence: 0.3 };
 
+  if (
+    combined.includes("abandon") ||
+    combined.includes("dropoff") ||
+    combined.includes("bounce") ||
+    combined.includes("friction") ||
+    combined.includes("timeout") ||
+    combined.includes("stalled") ||
+    combined.includes("failed_checkout") ||
+    combined.includes("cancelled_flow")
+  ) {
+    return { lane: "friction_dropoff", confidence: 0.86 };
+  }
+
+  if (
+    combined.includes("action_taken") ||
+    combined.includes("executed") ||
+    combined.includes("confirmed") ||
+    combined.includes("submitted") ||
+    combined.includes("completed") ||
+    combined.includes("purchased")
+  ) {
+    return { lane: "action_taken", confidence: 0.84 };
+  }
+
+  if (
+    combined.includes("decision") ||
+    combined.includes("compare") ||
+    combined.includes("evaluate") ||
+    combined.includes("shortlist") ||
+    combined.includes("quote_requested") ||
+    combined.includes("rfq")
+  ) {
+    return { lane: "decision_progression", confidence: 0.82 };
+  }
+
+  if (
+    combined.includes("entity_interest") ||
+    combined.includes("watchlist") ||
+    combined.includes("follow") ||
+    combined.includes("track") ||
+    combined.includes("monitor") ||
+    combined.includes("profile_view") ||
+    combined.includes("viewed_entity")
+  ) {
+    return { lane: "entity_interest", confidence: 0.8 };
+  }
+
   if (combined.includes("search")) return { lane: "search_intent", confidence: 0.9 };
   if (combined.includes("capacity_tightening")) {
     return { lane: "supply_signal", confidence: 0.9 };
   }
   if (combined.includes("update")) return { lane: "supply_signal", confidence: 0.7 };
   if (combined.includes("expired")) return { lane: "state_change", confidence: 0.8 };
-  if (combined.includes("trend") || combined.includes("momentum")) {
+  if (
+    combined.includes("trend") ||
+    combined.includes("momentum") ||
+    combined.includes("acceleration") ||
+    combined.includes("velocity")
+  ) {
     return { lane: "trend_momentum", confidence: 0.75 };
-  }
-  if (combined.includes("action") || combined.includes("executed")) {
-    return { lane: "action_taken", confidence: 0.8 };
   }
 
   return { lane: "unclassified", confidence: 0.4 };

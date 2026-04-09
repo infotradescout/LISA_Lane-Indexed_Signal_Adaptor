@@ -1,6 +1,6 @@
 import { shouldAlert } from "./interpreter.js";
 
-const BRIDGE = "http://localhost:3100";
+const BRIDGE = process.env.BRIDGE_URL || "http://localhost:3100";
 
 let afterId = 0;
 

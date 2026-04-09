@@ -1,0 +1,57 @@
+[
+  {
+    "id": "seed_supply_update",
+    "input": "{\"type\":\"state_update\",\"payload\":{\"entity\":\"contractor_availability\",\"location\":\"Tangipahoa\",\"change\":\"availability_updated\"}}",
+    "expected": {
+      "lane": "supply_signal",
+      "min_confidence": 0.7,
+      "entity": "contractor_availability",
+      "change": "availability_updated",
+      "should_alert": false
+    }
+  },
+  {
+    "id": "seed_state_expired",
+    "input": "{\"type\":\"state_expired\",\"payload\":{\"entity\":\"contractor_availability\",\"location\":\"Tangipahoa\",\"change\":\"state_expired\"}}",
+    "expected": {
+      "lane": "state_change",
+      "min_confidence": 0.8,
+      "entity": "contractor_availability",
+      "change": "state_expired",
+      "should_alert": false
+    }
+  },
+  {
+    "id": "seed_capacity_tightening",
+    "input": "{\"type\":\"state_update\",\"payload\":{\"signal\":\"capacity_tightening\",\"entity\":\"market_capacity\",\"location\":\"Tangipahoa\",\"change\":\"capacity_tightening\"}}",
+    "expected": {
+      "lane": "supply_signal",
+      "min_confidence": 0.85,
+      "entity": "market_capacity",
+      "change": "capacity_tightening",
+      "should_alert": true
+    }
+  },
+  {
+    "id": "seed_entity_interest",
+    "input": "{\"type\":\"state_update\",\"payload\":{\"event\":\"profile_view\",\"entity\":\"roofer_co_12\",\"change\":\"viewed_entity\"}}",
+    "expected": {
+      "lane": "entity_interest",
+      "min_confidence": 0.8,
+      "entity": "roofer_co_12",
+      "change": "viewed_entity",
+      "should_alert": false
+    }
+  },
+  {
+    "id": "seed_decision_progression",
+    "input": "{\"type\":\"state_update\",\"payload\":{\"event\":\"quote_requested\",\"entity\":\"roofer_co_12\",\"change\":\"quote_requested\"}}",
+    "expected": {
+      "lane": "decision_progression",
+      "min_confidence": 0.8,
+      "entity": "roofer_co_12",
+      "change": "quote_requested",
+      "should_alert": false
+    }
+  }
+]

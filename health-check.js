@@ -1,4 +1,4 @@
-const BRIDGE = "http://localhost:3100";
+const BRIDGE = process.env.BRIDGE_URL || "http://localhost:3100";
 
 function fmt(ts) {
   if (!ts) return "none";
@@ -30,4 +30,3 @@ main().catch((e) => {
   console.log(`[BRIDGE ERROR] ${e.message}`);
   process.exit(2);
 });
-);
