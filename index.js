@@ -44,6 +44,13 @@ const RECONNECT_BASE_MS = numEnv("SSE_RECONNECT_BASE_MS", 2000);
 const RECONNECT_MAX_MS = numEnv("SSE_RECONNECT_MAX_MS", 60000);
 const DRAIN_ON_SHUTDOWN = boolEnv("BRIDGE_DRAIN_ON_SHUTDOWN", false);
 const DRAIN_FILE_PATH = process.env.BRIDGE_DRAIN_FILE || "";
+const AUTO_BOOTSTRAP_ON_STREAM_MISMATCH = boolEnv(
+  "AUTO_BOOTSTRAP_ON_STREAM_MISMATCH",
+  true
+);
+const BOOTSTRAP_FIXTURE_PATH =
+  process.env.BOOTSTRAP_FIXTURE_PATH ||
+  path.join(process.cwd(), "fixtures", "replay-events.sample.json");
 
 // ---- In-memory ring buffer ----
 const events = [];
@@ -103,6 +110,129 @@ let sseConnected = false;
 let lastEventAt = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
 let reconnectTimer = null;
+let fallbackBootstrapped = false;
+
+function fixtureInputToString(input) {
+  if (typeof input === "string") return input;
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return String(input ?? "");
+  }
+}
+
+function bootstrapFallbackSignals(reason) {
+  if (fallbackBootstrapped) return;
+  if (!AUTO_BOOTSTRAP_ON_STREAM_MISMATCH) return;
+
+  try {
+    if (!fs.existsSync(BOOTSTRAP_FIXTURE_PATH)) {
+      recordEvent({
+        type: "bridge_bootstrap_skipped",
+        reason,
+        fixturePath: BOOTSTRAP_FIXTURE_PATH,
+      });
+      return;
+    }
+
+    const raw = fs.readFileSync(BOOTSTRAP_FIXTURE_PATH, "utf8");
+    const fixtures = JSON.parse(raw);
+    if (!Array.isArray(fixtures)) {
+      recordEvent({
+        type: "bridge_bootstrap_skipped",
+        reason,
+        fixturePath: BOOTSTRAP_FIXTURE_PATH,
+        error: "fixture file must be an array",
+      });
+      return;
+    }
+
+    let seeded = 0;
+    for (const item of fixtures) {
+      if (!item || !("input" in item)) continue;
+      const data = fixtureInputToString(item.input);
+      recordEvent({
+        type: "sse_message",
+        data,
+        signal: deriveSignalFromSseMessage(data),
+      });
+      seeded += 1;
+    }
+
+    fallbackBootstrapped = true;
+    recordEvent({
+      type: "bridge_bootstrap_complete",
+      reason,
+      fixturePath: BOOTSTRAP_FIXTURE_PATH,
+      seeded,
+    });
+  } catch (err) {
+    recordEvent({
+      type: "bridge_bootstrap_error",
+      reason,
+      fixturePath: BOOTSTRAP_FIXTURE_PATH,
+      error: String(err?.message || err),
+    });
+  }
+}
+
+async function preflightStreamEndpoint(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 5000);
+
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    const contentType = String(resp.headers.get("content-type") || "");
+    if (!resp.ok) {
+      return {
+        ok: false,
+        status: resp.status,
+        contentType,
+        reason: "non-2xx response",
+      };
+    }
+
+    if (!contentType.toLowerCase().includes("text/event-stream")) {
+      return {
+        ok: false,
+        status: resp.status,
+        contentType,
+        reason: "content-type is not text/event-stream",
+      };
+    }
+
+    try {
+      await resp.body?.cancel();
+    } catch {
+      // Ignore; preflight only needs headers.
+    }
+
+    return {
+      ok: true,
+      status: resp.status,
+      contentType,
+      reason: "ok",
+    };
+  } catch (err) {
+    clearTimeout(timeout);
+    return {
+      ok: false,
+      status: null,
+      contentType: "",
+      reason: String(err?.message || err),
+    };
+  }
+}
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -124,7 +254,22 @@ function processIncomingSse(data) {
   });
 }
 
-function connectToV1() {
+async function connectToV1() {
+  const preflight = await preflightStreamEndpoint(V1_STREAM_URL);
+  if (!preflight.ok) {
+    sseConnected = false;
+    recordEvent({
+      type: "bridge_config_error",
+      v1StreamUrl: V1_STREAM_URL,
+      status: preflight.status,
+      contentType: preflight.contentType,
+      reason: preflight.reason,
+    });
+    bootstrapFallbackSignals("stream_preflight_failed");
+    scheduleReconnect();
+    return;
+  }
+
   const es = new EventSource(V1_STREAM_URL);
 
   es.onopen = () => {
@@ -455,11 +600,14 @@ function drainEventsToFile(reason) {
 
 const server = app.listen(PORT, () => {
   console.log("[bridge] listening on port " + PORT);
-  try {
-    connectToV1();
-  } catch (err) {
+  connectToV1().catch((err) => {
     console.error("[ERROR] Failed to connect to v1:", err);
-  }
+    recordEvent({
+      type: "bridge_connect_error",
+      reason: String(err?.message || err),
+    });
+    scheduleReconnect();
+  });
 });
 
 let shuttingDown = false;
