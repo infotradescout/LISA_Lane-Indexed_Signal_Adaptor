@@ -56,8 +56,9 @@ const UPSTREAM_FEED_SOURCES = (
     "http://localhost:8087/feed|30000",
     "http://localhost:5173/api/signals|60000",
     "http://localhost:5174/api/signals|60000",
-    "http://localhost:5000/signals|60000",
-    "http://localhost:8000/signals|60000",
+    "http://localhost:5000/api/signals|60000",
+    "http://localhost:8000/api/signals|60000",
+    "http://localhost:8510/api/signals|60000",
   ].join(",")
 )
   .split(",")
@@ -442,7 +443,6 @@ app.get("/health", (_req, res) => {
     maxEvents: MAX_EVENTS,
     reconnectBaseMs: RECONNECT_BASE_MS,
     reconnectMaxMs: RECONNECT_MAX_MS,
-    reconnectNextMs: reconnectDelayMs,
     drainOnShutdown: DRAIN_ON_SHUTDOWN,
     drainFilePath: DRAIN_FILE_PATH || null,
     interpreterVersion: INTERPRETER_VERSION,
@@ -622,8 +622,9 @@ function summarizeRaw(raw) {
 
 async function refresh() {
   const health = await fetchJson("/health");
+  const totalSources = health.totalSources ?? ((health.sources?.sse?.length || 0) + (health.sources?.feeds?.length || 0));
   document.getElementById("bridge").textContent =
-    "port=" + health.bridgePort + "  v1=" + health.v1StreamUrl;
+    "port=" + health.bridgePort + "  sources=" + totalSources;
 
   setPill(document.getElementById("conn"), !!health.sseConnected, health.sseConnected ? "SSE CONNECTED" : "SSE DISCONNECTED");
   document.getElementById("last").textContent = health.lastEventAt || "(none yet)";
