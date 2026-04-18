@@ -53,12 +53,12 @@ const UPSTREAM_SSE_SOURCES = (
 const UPSTREAM_FEED_SOURCES = (
   process.env.UPSTREAM_FEED_SOURCES ||
   [
-    "http://localhost:8087/feed|30000",
-    "http://localhost:5173/api/signals|60000",
-    "http://localhost:5174/api/signals|60000",
-    "http://localhost:5000/api/signals|60000",
-    "http://localhost:8000/api/signals|60000",
-    "http://localhost:8510/api/signals|60000",
+    "http://localhost:8087/latest|30000",
+    "http://localhost:5173|60000",
+    "http://localhost:5174|60000",
+    "http://localhost:5000/healthz|60000",
+    "http://localhost:8000/health|60000",
+    "http://localhost:8510|60000",
   ].join(",")
 )
   .split(",")
@@ -378,11 +378,39 @@ async function pollFeedSource(url) {
     const fetchUrl = state.lastSignalId > 0 ? `${url}?after_id=${state.lastSignalId}` : url;
     const resp = await fetch(fetchUrl, { signal: AbortSignal.timeout(8000) });
     if (!resp.ok) return;
-    const data = await resp.json();
     state.lastFetched = new Date().toISOString();
 
+    let data = null;
+    try {
+      data = await resp.json();
+    } catch {
+      // Some source endpoints are health/docs/html only; still emit heartbeat below.
+    }
+
     const items = data?.items ?? data?.signals ?? data?.results ?? [];
-    if (!Array.isArray(items)) return;
+    if (!Array.isArray(items) || items.length === 0) {
+      const synthetic = JSON.stringify({
+        id: Date.now(),
+        lane: "infrastructure",
+        signal_kind: "source_heartbeat",
+        confidence: 0.82,
+        score: 52,
+        impact_level: "low",
+        trend: "neutral",
+        velocity: "steady",
+        action_hint: `source reachable: ${url}`,
+        tags: ["source", "heartbeat"],
+        source_class: "http_feed",
+        observed_fact: `HTTP source reachable: ${url}`,
+      });
+      recordEvent({
+        type: "sse_message",
+        source: url,
+        data: synthetic,
+        signal: deriveSignalFromSseMessage(synthetic),
+      });
+      return;
+    }
 
     let newMax = state.lastSignalId;
     for (const item of items) {
