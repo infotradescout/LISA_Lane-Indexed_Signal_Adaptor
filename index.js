@@ -37,9 +37,27 @@ function boolEnv(name, fallback) {
 
 loadDotEnv();
 
-const V1_STREAM_URL = process.env.V1_STREAM_URL || "http://localhost:3000/stream";
+// ---- Upstream sources (all feed into LISA independently) ----
+// SSE streams
+const UPSTREAM_SSE_SOURCES = (
+  process.env.UPSTREAM_SSE_SOURCES ||
+  "http://localhost:3011/stream,http://localhost:3012/stream"
+)
+  .split(",")
+  .map((u) => u.trim())
+  .filter(Boolean);
+
+// FactDeck feed poll (HTTP JSON) — LISA reads this as a source
+const FACTDECK_FEED_URL = process.env.FACTDECK_FEED_URL || "http://localhost:8087/feed";
+const FACTDECK_POLL_MS  = numEnv("FACTDECK_POLL_MS", 30000);
+
+// Legacy single-stream env kept for backward compat, merged into sources if set
+if (process.env.V1_STREAM_URL && !UPSTREAM_SSE_SOURCES.includes(process.env.V1_STREAM_URL)) {
+  UPSTREAM_SSE_SOURCES.push(process.env.V1_STREAM_URL);
+}
+
 const PORT = numEnv("PORT", 3100);
-const MAX_EVENTS = numEnv("MAX_EVENTS", 200);
+const MAX_EVENTS = numEnv("MAX_EVENTS", 500);
 const RECONNECT_BASE_MS = numEnv("SSE_RECONNECT_BASE_MS", 2000);
 const RECONNECT_MAX_MS = numEnv("SSE_RECONNECT_MAX_MS", 60000);
 const DRAIN_ON_SHUTDOWN = boolEnv("BRIDGE_DRAIN_ON_SHUTDOWN", false);
@@ -112,12 +130,33 @@ function recordEvent(evt) {
   return entry;
 }
 
-// ---- SSE connection ----
-let sseConnected = false;
-let lastEventAt = null;
-let reconnectDelayMs = RECONNECT_BASE_MS;
-let reconnectTimer = null;
+// ---- SSE connection state (per source) ----
+const sourceState = {};   // url -> { connected, lastEventAt, reconnectDelayMs, reconnectTimer }
 let fallbackBootstrapped = false;
+
+function getSourceState(url) {
+  if (!sourceState[url]) {
+    sourceState[url] = {
+      connected: false,
+      lastEventAt: null,
+      reconnectDelayMs: RECONNECT_BASE_MS,
+      reconnectTimer: null,
+    };
+  }
+  return sourceState[url];
+}
+
+// Legacy compat helpers used in /health and elsewhere
+function isSseConnected() {
+  return Object.values(sourceState).some((s) => s.connected);
+}
+function getLastEventAt() {
+  return Object.values(sourceState)
+    .map((s) => s.lastEventAt)
+    .filter(Boolean)
+    .sort()
+    .at(-1) ?? null;
+}
 
 function fixtureInputToString(input) {
   if (typeof input === "string") return input;
@@ -241,92 +280,104 @@ async function preflightStreamEndpoint(url) {
   }
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  const waitMs = reconnectDelayMs;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectToV1();
+function scheduleReconnect(url) {
+  const s = getSourceState(url);
+  if (s.reconnectTimer) return;
+  const waitMs = s.reconnectDelayMs;
+  s.reconnectTimer = setTimeout(() => {
+    s.reconnectTimer = null;
+    connectToSource(url);
   }, waitMs);
-  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
-  recordEvent({ type: "bridge_reconnect_scheduled", waitMs });
+  s.reconnectDelayMs = Math.min(s.reconnectDelayMs * 2, RECONNECT_MAX_MS);
+  recordEvent({ type: "bridge_reconnect_scheduled", source: url, waitMs });
 }
 
-function processIncomingSse(data) {
-  lastEventAt = new Date().toISOString();
+function processIncomingSse(data, sourceUrl) {
+  const s = getSourceState(sourceUrl);
+  s.lastEventAt = new Date().toISOString();
   recordEvent({
     type: "sse_message",
+    source: sourceUrl,
     data,
     signal: deriveSignalFromSseMessage(data),
   });
 }
 
-async function connectToV1() {
-  const preflight = await preflightStreamEndpoint(V1_STREAM_URL);
+async function connectToSource(url) {
+  const s = getSourceState(url);
+  const preflight = await preflightStreamEndpoint(url);
   if (!preflight.ok) {
-    sseConnected = false;
+    s.connected = false;
     recordEvent({
       type: "bridge_config_error",
-      v1StreamUrl: V1_STREAM_URL,
+      source: url,
       status: preflight.status,
       contentType: preflight.contentType,
       reason: preflight.reason,
     });
     bootstrapFallbackSignals("stream_preflight_failed");
-    scheduleReconnect();
+    scheduleReconnect(url);
     return;
   }
 
-  const es = new EventSource(V1_STREAM_URL);
+  const es = new EventSource(url);
 
   es.onopen = () => {
-    sseConnected = true;
-    reconnectDelayMs = RECONNECT_BASE_MS;
-    recordEvent({ type: "bridge_connected" });
+    s.connected = true;
+    s.reconnectDelayMs = RECONNECT_BASE_MS;
+    recordEvent({ type: "bridge_connected", source: url });
   };
 
   es.onerror = () => {
-    sseConnected = false;
-    recordEvent({ type: "bridge_disconnected" });
+    s.connected = false;
+    recordEvent({ type: "bridge_disconnected", source: url });
     es.close();
-    scheduleReconnect();
+    scheduleReconnect(url);
   };
 
-  // Generic message handler (for events without explicit event: field)
-  es.onmessage = (msg) => {
-    processIncomingSse(msg.data);
-  };
+  es.onmessage = (msg) => processIncomingSse(msg.data, url);
 
-  // Specific event handlers for v1's named events
-  es.addEventListener("hello", (msg) => {
-    try {
-      console.log("[hello event] received");
-      processIncomingSse(msg.data);
-      console.log("[hello event] processed");
-    } catch (err) {
-      console.error("[hello event] ERROR:", err);
-    }
-  });
+  es.addEventListener("hello",        (msg) => processIncomingSse(msg.data, url));
+  es.addEventListener("signal",       (msg) => processIncomingSse(msg.data, url));
+  es.addEventListener("state_update", (msg) => processIncomingSse(msg.data, url));
+  es.addEventListener("state_expired",(msg) => processIncomingSse(msg.data, url));
+}
 
-  es.addEventListener("state_update", (msg) => {
-    try {
-      console.log("[state_update event] received");
-      processIncomingSse(msg.data);
-      console.log("[state_update event] processed");
-    } catch (err) {
-      console.error("[state_update event] ERROR:", err);
-    }
-  });
+// ---- FactDeck poll — reads feed as a source ----
+let factdeckLastFetched = null;
+let factdeckLastSignalId = 0;
 
-  es.addEventListener("state_expired", (msg) => {
-    try {
-      console.log("[state_expired event] received");
-      processIncomingSse(msg.data);
-      console.log("[state_expired event] processed");
-    } catch (err) {
-      console.error("[state_expired event] ERROR:", err);
+async function pollFactDeck() {
+  try {
+    const url = FACTDECK_FEED_URL + (factdeckLastSignalId > 0 ? `?after_id=${factdeckLastSignalId}` : "");
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    factdeckLastFetched = new Date().toISOString();
+
+    const items = data?.items ?? data?.signals ?? [];
+    let newMax = factdeckLastSignalId;
+    for (const item of items) {
+      const itemId = Number(item?.id || 0);
+      if (itemId <= factdeckLastSignalId) continue;
+      if (itemId > newMax) newMax = itemId;
+      const synthetic = JSON.stringify({ ...item, source_class: "factdeck_feed" });
+      recordEvent({
+        type: "sse_message",
+        source: FACTDECK_FEED_URL,
+        data: synthetic,
+        signal: deriveSignalFromSseMessage(synthetic),
+      });
     }
-  });
+    factdeckLastSignalId = newMax;
+  } catch {
+    // FactDeck may not be running; non-fatal
+  }
+}
+
+function startFactDeckPoller() {
+  pollFactDeck();
+  setInterval(pollFactDeck, FACTDECK_POLL_MS);
 }
 
 // ---- Express server ----
@@ -338,12 +389,21 @@ const app = express();
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
-    sseConnected,
-    lastEventAt,
+    sseConnected: isSseConnected(),
+    lastEventAt: getLastEventAt(),
+    sources: UPSTREAM_SSE_SOURCES.map((url) => ({
+      url,
+      connected: getSourceState(url).connected,
+      lastEventAt: getSourceState(url).lastEventAt,
+    })),
+    factdeckSource: {
+      url: FACTDECK_FEED_URL,
+      lastFetched: factdeckLastFetched,
+      lastSignalId: factdeckLastSignalId,
+    },
     bufferedEvents: events.length,
     maxBufferedEvents: MAX_EVENTS,
     uptimeSeconds: Math.floor(process.uptime()),
-    v1StreamUrl: V1_STREAM_URL,
     bridgePort: PORT,
     maxEvents: MAX_EVENTS,
     reconnectBaseMs: RECONNECT_BASE_MS,
@@ -606,15 +666,21 @@ function drainEventsToFile(reason) {
 }
 
 const server = app.listen(PORT, () => {
-  console.log("[bridge] listening on port " + PORT);
-  connectToV1().catch((err) => {
-    console.error("[ERROR] Failed to connect to v1:", err);
-    recordEvent({
-      type: "bridge_connect_error",
-      reason: String(err?.message || err),
+  console.log("[LISA] listening on port " + PORT);
+  console.log("[LISA] upstream SSE sources: " + UPSTREAM_SSE_SOURCES.join(", "));
+  console.log("[LISA] FactDeck source poll: " + FACTDECK_FEED_URL + " every " + FACTDECK_POLL_MS + "ms");
+
+  // Connect to all SSE sources independently
+  for (const url of UPSTREAM_SSE_SOURCES) {
+    connectToSource(url).catch((err) => {
+      console.error("[LISA] Failed to connect to source " + url + ":", err);
+      recordEvent({ type: "bridge_connect_error", source: url, reason: String(err?.message || err) });
+      scheduleReconnect(url);
     });
-    scheduleReconnect();
-  });
+  }
+
+  // Start FactDeck feed poll
+  startFactDeckPoller();
 });
 
 let shuttingDown = false;
@@ -622,7 +688,9 @@ function shutdown(reason) {
   if (shuttingDown) return;
   shuttingDown = true;
   drainEventsToFile(reason);
-  if (reconnectTimer) clearTimeout(reconnectTimer);
+  for (const s of Object.values(sourceState)) {
+    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+  }
   server.close(() => {
     process.exit(0);
   });
