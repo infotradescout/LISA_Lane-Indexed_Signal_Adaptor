@@ -37,8 +37,9 @@ function boolEnv(name, fallback) {
 
 loadDotEnv();
 
-// ---- Upstream sources (all feed into LISA independently) ----
-// SSE streams
+// ---- Upstream sources (all 8 feed into LISA independently) ----
+
+// 1. SSE streams (real-time push) — gulf-live-stream, business-presence-engine
 const UPSTREAM_SSE_SOURCES = (
   process.env.UPSTREAM_SSE_SOURCES ||
   "http://localhost:3011/stream,http://localhost:3012/stream"
@@ -47,17 +48,36 @@ const UPSTREAM_SSE_SOURCES = (
   .map((u) => u.trim())
   .filter(Boolean);
 
-// FactDeck feed poll (HTTP JSON) — LISA reads this as a source
+// 2. HTTP feed sources (polled) — FactDeck, NewsFilter, MealScout, AutoBott, AssetOS
+//    Format per entry: "baseUrl|pollMs" — pollMs optional, defaults to FACTDECK_POLL_MS
+const UPSTREAM_FEED_SOURCES = (
+  process.env.UPSTREAM_FEED_SOURCES ||
+  [
+    "http://localhost:8087/feed|30000",
+    "http://localhost:5173/api/signals|60000",
+    "http://localhost:5174/api/signals|60000",
+    "http://localhost:5000/signals|60000",
+    "http://localhost:8000/signals|60000",
+  ].join(",")
+)
+  .split(",")
+  .map((entry) => {
+    const [url, ms] = entry.trim().split("|");
+    return { url: url.trim(), pollMs: ms ? Number(ms) : 30000 };
+  })
+  .filter((e) => e.url);
+
+// Legacy FactDeck env kept for compat
 const FACTDECK_FEED_URL = process.env.FACTDECK_FEED_URL || "http://localhost:8087/feed";
 const FACTDECK_POLL_MS  = numEnv("FACTDECK_POLL_MS", 30000);
 
-// Legacy single-stream env kept for backward compat, merged into sources if set
+// Legacy single-stream env kept for backward compat
 if (process.env.V1_STREAM_URL && !UPSTREAM_SSE_SOURCES.includes(process.env.V1_STREAM_URL)) {
   UPSTREAM_SSE_SOURCES.push(process.env.V1_STREAM_URL);
 }
 
 const PORT = numEnv("PORT", 3100);
-const MAX_EVENTS = numEnv("MAX_EVENTS", 500);
+const MAX_EVENTS = numEnv("MAX_EVENTS", 1000);
 const RECONNECT_BASE_MS = numEnv("SSE_RECONNECT_BASE_MS", 2000);
 const RECONNECT_MAX_MS = numEnv("SSE_RECONNECT_MAX_MS", 60000);
 const DRAIN_ON_SHUTDOWN = boolEnv("BRIDGE_DRAIN_ON_SHUTDOWN", false);
@@ -343,41 +363,51 @@ async function connectToSource(url) {
   es.addEventListener("state_expired",(msg) => processIncomingSse(msg.data, url));
 }
 
-// ---- FactDeck poll — reads feed as a source ----
-let factdeckLastFetched = null;
-let factdeckLastSignalId = 0;
+// ---- HTTP feed pollers — one per UPSTREAM_FEED_SOURCES entry ----
+const feedPollState = {};  // url -> { lastSignalId, lastFetched }
 
-async function pollFactDeck() {
+function getFeedState(url) {
+  if (!feedPollState[url]) feedPollState[url] = { lastSignalId: 0, lastFetched: null };
+  return feedPollState[url];
+}
+
+async function pollFeedSource(url) {
+  const state = getFeedState(url);
   try {
-    const url = FACTDECK_FEED_URL + (factdeckLastSignalId > 0 ? `?after_id=${factdeckLastSignalId}` : "");
-    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const fetchUrl = state.lastSignalId > 0 ? `${url}?after_id=${state.lastSignalId}` : url;
+    const resp = await fetch(fetchUrl, { signal: AbortSignal.timeout(8000) });
     if (!resp.ok) return;
     const data = await resp.json();
-    factdeckLastFetched = new Date().toISOString();
+    state.lastFetched = new Date().toISOString();
 
-    const items = data?.items ?? data?.signals ?? [];
-    let newMax = factdeckLastSignalId;
+    const items = data?.items ?? data?.signals ?? data?.results ?? [];
+    if (!Array.isArray(items)) return;
+
+    let newMax = state.lastSignalId;
     for (const item of items) {
       const itemId = Number(item?.id || 0);
-      if (itemId <= factdeckLastSignalId) continue;
+      if (itemId > 0 && itemId <= state.lastSignalId) continue;
       if (itemId > newMax) newMax = itemId;
-      const synthetic = JSON.stringify({ ...item, source_class: "factdeck_feed" });
+      const synthetic = JSON.stringify({ ...item, source_class: "http_feed", _feed_source: url });
       recordEvent({
         type: "sse_message",
-        source: FACTDECK_FEED_URL,
+        source: url,
         data: synthetic,
         signal: deriveSignalFromSseMessage(synthetic),
       });
     }
-    factdeckLastSignalId = newMax;
+    if (newMax > state.lastSignalId) state.lastSignalId = newMax;
   } catch {
-    // FactDeck may not be running; non-fatal
+    // Source may be down — non-fatal, will retry next interval
   }
 }
 
-function startFactDeckPoller() {
-  pollFactDeck();
-  setInterval(pollFactDeck, FACTDECK_POLL_MS);
+function startFeedPollers() {
+  for (const { url, pollMs } of UPSTREAM_FEED_SOURCES) {
+    console.log(`[LISA] HTTP feed source: ${url} (poll every ${pollMs}ms)`);
+    pollFeedSource(url);
+    setInterval(() => pollFeedSource(url), pollMs);
+  }
 }
 
 // ---- Express server ----
@@ -391,16 +421,20 @@ app.get("/health", (_req, res) => {
     status: "ok",
     sseConnected: isSseConnected(),
     lastEventAt: getLastEventAt(),
-    sources: UPSTREAM_SSE_SOURCES.map((url) => ({
-      url,
-      connected: getSourceState(url).connected,
-      lastEventAt: getSourceState(url).lastEventAt,
-    })),
-    factdeckSource: {
-      url: FACTDECK_FEED_URL,
-      lastFetched: factdeckLastFetched,
-      lastSignalId: factdeckLastSignalId,
+    sources: {
+      sse: UPSTREAM_SSE_SOURCES.map((url) => ({
+        url,
+        connected: getSourceState(url).connected,
+        lastEventAt: getSourceState(url).lastEventAt,
+      })),
+      feeds: UPSTREAM_FEED_SOURCES.map(({ url, pollMs }) => ({
+        url,
+        pollMs,
+        lastFetched: getFeedState(url).lastFetched,
+        lastSignalId: getFeedState(url).lastSignalId,
+      })),
     },
+    totalSources: UPSTREAM_SSE_SOURCES.length + UPSTREAM_FEED_SOURCES.length,
     bufferedEvents: events.length,
     maxBufferedEvents: MAX_EVENTS,
     uptimeSeconds: Math.floor(process.uptime()),
@@ -667,8 +701,9 @@ function drainEventsToFile(reason) {
 
 const server = app.listen(PORT, () => {
   console.log("[LISA] listening on port " + PORT);
-  console.log("[LISA] upstream SSE sources: " + UPSTREAM_SSE_SOURCES.join(", "));
-  console.log("[LISA] FactDeck source poll: " + FACTDECK_FEED_URL + " every " + FACTDECK_POLL_MS + "ms");
+  console.log("[LISA] SSE sources (" + UPSTREAM_SSE_SOURCES.length + "): " + UPSTREAM_SSE_SOURCES.join(", "));
+  console.log("[LISA] Feed sources (" + UPSTREAM_FEED_SOURCES.length + "): " + UPSTREAM_FEED_SOURCES.map((s) => s.url).join(", "));
+  console.log("[LISA] Total sources: " + (UPSTREAM_SSE_SOURCES.length + UPSTREAM_FEED_SOURCES.length));
 
   // Connect to all SSE sources independently
   for (const url of UPSTREAM_SSE_SOURCES) {
@@ -679,8 +714,8 @@ const server = app.listen(PORT, () => {
     });
   }
 
-  // Start FactDeck feed poll
-  startFactDeckPoller();
+  // Start all HTTP feed pollers
+  startFeedPollers();
 });
 
 let shuttingDown = false;
