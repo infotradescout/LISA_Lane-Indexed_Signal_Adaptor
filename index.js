@@ -3,11 +3,13 @@ import { EventSource } from "eventsource";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  deriveSignalFromSseMessage,
   INTERPRETER_VERSION,
   LANE_ONTOLOGY,
   SIGNAL_CONTRACT_FIELDS,
 } from "./interpreter.js";
+import { buildPacket } from "./ingest/envelope.js";
+import { getRecentCanonicalSignals, getIngestionOpsSummary, ingestPacket } from "./ingest/service.js";
+import { startInboxWatcher } from "./ingest/inboxWatcher.js";
 
 function loadDotEnv() {
   const envPath = path.join(process.cwd(), ".env");
@@ -44,6 +46,12 @@ const RECONNECT_BASE_MS = numEnv("SSE_RECONNECT_BASE_MS", 2000);
 const RECONNECT_MAX_MS = numEnv("SSE_RECONNECT_MAX_MS", 60000);
 const DRAIN_ON_SHUTDOWN = boolEnv("BRIDGE_DRAIN_ON_SHUTDOWN", false);
 const DRAIN_FILE_PATH = process.env.BRIDGE_DRAIN_FILE || "";
+const INBOX_ENABLED = boolEnv("INGEST_INBOX_ENABLED", true);
+const INBOX_DIR = process.env.INGEST_INBOX_DIR || path.join(process.cwd(), "inbox");
+const INBOX_ARCHIVE_DIR =
+  process.env.INGEST_INBOX_ARCHIVE_DIR || path.join(INBOX_DIR, "processed");
+const INBOX_FAILED_DIR = process.env.INGEST_INBOX_FAILED_DIR || path.join(INBOX_DIR, "failed");
+const INBOX_POLL_MS = numEnv("INGEST_INBOX_POLL_MS", 1500);
 
 // ---- In-memory ring buffer ----
 const events = [];
@@ -51,35 +59,43 @@ let seq = 0;
 const signalSubscribers = new Set();
 
 function mapEventToApiSignal(e) {
+  const signal = e.signal || e.signals?.[0] || null;
   return {
     id: e.id,
     receivedAt: e.receivedAt,
-    lane: e.signal?.lane ?? "unknown",
-    confidence: e.signal?.confidence ?? 0,
-    observed_fact: e.signal?.observed_fact ?? null,
-    source: e.signal?.source ?? "unknown",
-    entity: e.signal?.entity ?? null,
-    location: e.signal?.location ?? null,
-    change: e.signal?.change ?? null,
-    source_class: e.signal?.source_class ?? "external_stream",
-    ambiguous: !!e.signal?.ambiguous,
-    needs_review: !!e.signal?.needs_review,
-    review_reason: e.signal?.review_reason ?? null,
-    signal: e.signal?.lane ?? "unknown",
-    raw: e.signal?.raw ?? e.data ?? null,
-    payload: e.signal?.payload ?? null,
+    lane: signal?.lane ?? "unknown",
+    confidence: signal?.confidence ?? 0,
+    observed_fact: signal?.summary ?? null,
+    source: signal?.source_system ?? "unknown",
+    entity: signal?.entity ?? null,
+    location: null,
+    change: signal?.category ?? null,
+    source_class: signal?.source_type ?? "knowledge_packet",
+    ambiguous: Array.isArray(signal?.contradiction_refs) && signal.contradiction_refs.length > 0,
+    needs_review: Array.isArray(signal?.contradiction_refs) && signal.contradiction_refs.length > 0,
+    review_reason:
+      Array.isArray(signal?.contradiction_refs) && signal.contradiction_refs.length > 0
+        ? "contradiction_detected"
+        : null,
+    signal: signal?.lane ?? "unknown",
+    raw: signal?.raw_payload ?? e.data ?? null,
+    payload: signal ?? null,
   };
 }
 
 function broadcastSignal(entry) {
   if (!signalSubscribers.size) return;
-  const payload = mapEventToApiSignal(entry);
-  const body = JSON.stringify(payload);
-  for (const send of signalSubscribers) {
-    try {
-      send(payload.id, body);
-    } catch {
-      // Ignore dead subscribers; close handler removes them.
+  const signals = entry.signals || (entry.signal ? [entry.signal] : []);
+  for (const signal of signals) {
+    const payload = mapEventToApiSignal({ ...entry, signal });
+    payload.id = entry.id;
+    const body = JSON.stringify(payload);
+    for (const send of signalSubscribers) {
+      try {
+        send(payload.id, body);
+      } catch {
+        // Ignore dead subscribers; close handler removes them.
+      }
     }
   }
 }
@@ -92,7 +108,7 @@ function recordEvent(evt) {
   };
   events.push(entry);
   while (events.length > MAX_EVENTS) events.shift();
-  if (entry.type === "sse_message" && entry.signal) {
+  if (Array.isArray(entry.signals) && entry.signals.length) {
     broadcastSignal(entry);
   }
   return entry;
@@ -117,10 +133,28 @@ function scheduleReconnect() {
 
 function processIncomingSse(data) {
   lastEventAt = new Date().toISOString();
+  const packet = buildPacket({
+    sourceSystem: "v1_stream",
+    sourceSystemVersion: "legacy_sse_bridge",
+    packetType: "sse_message",
+    generatedAt: lastEventAt,
+    summary: "legacy stream event",
+    items: [{ raw: data }],
+    publishStatus: "published",
+  });
+  const ingestResult = ingestPacket(packet);
   recordEvent({
     type: "sse_message",
     data,
-    signal: deriveSignalFromSseMessage(data),
+    packet,
+    ingestResult: {
+      ok: ingestResult.ok,
+      errors: ingestResult.errors,
+      unknownFields: ingestResult.unknownFields,
+      contradictions: ingestResult.contradictions.length,
+      promoted: ingestResult.promoted,
+    },
+    signals: ingestResult.normalizedSignals,
   });
 }
 
@@ -179,11 +213,12 @@ function connectToV1() {
 
 // ---- Express server ----
 const app = express();
-
-// Basic hard safety: this bridge is read-only; no POST routes exist.
-// (If someone adds one later, it is an intentional act.)
+app.use(express.json({ limit: "2mb" }));
+let stopInboxWatcher = () => {};
+let getInboxWatcherStats = () => ({ enabled: false });
 
 app.get("/health", (_req, res) => {
+  const ops = getIngestionOpsSummary();
   res.json({
     status: "ok",
     sseConnected,
@@ -202,6 +237,11 @@ app.get("/health", (_req, res) => {
     interpreterVersion: INTERPRETER_VERSION,
     laneOntology: LANE_ONTOLOGY,
     signalContractFields: SIGNAL_CONTRACT_FIELDS,
+    ingestionSchemaVersion: ops.schema_version,
+    knownAdapters: ops.known_adapters,
+    ingestionSources: ops.sources,
+    memory: ops.memory,
+    inboxWatcher: getInboxWatcherStats(),
   });
 });
 
@@ -236,19 +276,68 @@ app.get("/signals", (req, res) => {
   const afterIdRaw = Number(req.query.afterId ?? 0);
   const afterId = Number.isFinite(afterIdRaw) ? afterIdRaw : 0;
 
-  const filtered = events
-    .filter((e) => e.type === "sse_message")
-    .filter((e) => (afterId > 0 ? e.id > afterId : true));
-
+  const filtered = events.filter((e) => (afterId > 0 ? e.id > afterId : true));
   const sliced = filtered.slice(-limit);
-
-  const signals = sliced.map(mapEventToApiSignal);
+  const signals = sliced.flatMap((entry) =>
+    (entry.signals || []).map((signal) =>
+      mapEventToApiSignal({
+        ...entry,
+        signal,
+        id: entry.id,
+      })
+    )
+  );
 
   res.json({
     count: signals.length,
     latestId: events.length ? events[events.length - 1].id : 0,
     signals,
   });
+});
+
+// Canonical signal feed for LISA internals.
+app.get("/ingest/signals", (req, res) => {
+  const limitRaw = Number(req.query.limit ?? 100);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 100;
+  res.json({
+    count: limit,
+    signals: getRecentCanonicalSignals(limit),
+  });
+});
+
+// Producer publish endpoint for standardized packets.
+app.post("/ingest/packet", (req, res) => {
+  const packet = req.body;
+  const result = ingestPacket(packet);
+  recordEvent({
+    type: "ingest_packet",
+    packet,
+    ingestResult: {
+      ok: result.ok,
+      sourceSystem: result.sourceSystem,
+      errors: result.errors,
+      unknownFields: result.unknownFields,
+      contradictions: result.contradictions.length,
+      promoted: result.promoted,
+    },
+    signals: result.normalizedSignals,
+  });
+
+  const status = result.ok ? 200 : 400;
+  res.status(status).json({
+    ok: result.ok,
+    sourceSystem: result.sourceSystem,
+    errors: result.errors,
+    unknownFields: result.unknownFields,
+    normalizedSignals: result.normalizedSignals.length,
+    contradictions: result.contradictions,
+    promoted: result.promoted,
+  });
+});
+
+// Operator view: ingest pipeline health per source.
+app.get("/ingest/ops", (_req, res) => {
+  res.json(getIngestionOpsSummary());
 });
 
 // Push adapter: re-broadcast derived signals as SSE so consumers can subscribe.
@@ -281,7 +370,7 @@ app.get("/dashboard", (_req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>4data Stream Bridge Dashboard</title>
+  <title>LISA Dashboard</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; }
@@ -300,11 +389,11 @@ app.get("/dashboard", (_req, res) => {
   </style>
 </head>
 <body>
-  <h2>4data Stream Bridge</h2>
+  <h2>LISA (Lane-Indexed Signal Adaptor)</h2>
 
   <div class="row">
     <div class="card">
-      <div class="k">Bridge</div>
+      <div class="k">LISA Bridge</div>
       <div class="v mono" id="bridge"></div>
       <div style="margin-top:10px;">
         <button id="refresh">Refresh</button>
@@ -343,6 +432,23 @@ app.get("/dashboard", (_req, res) => {
     <tbody id="rows"></tbody>
   </table>
 
+  <h3 style="margin-top:18px;">Ingestion Ops</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>Last Packet</th>
+        <th>Packets</th>
+        <th>Status</th>
+        <th>Validation Errors</th>
+        <th>New Signals</th>
+        <th>Contradictions</th>
+        <th>Promoted</th>
+      </tr>
+    </thead>
+    <tbody id="opsRows"></tbody>
+  </table>
+
 <script>
 let auto = true;
 let lastSeenId = 0;
@@ -376,8 +482,9 @@ function summarizeRaw(raw) {
 
 async function refresh() {
   const health = await fetchJson("/health");
+  const ops = await fetchJson("/ingest/ops");
   document.getElementById("bridge").textContent =
-    "port=" + health.bridgePort + "  v1=" + health.v1StreamUrl;
+    "port=" + health.bridgePort + "  v1=" + health.v1StreamUrl + "  inbox=" + (health.inboxWatcher?.enabled ? "on" : "off");
 
   setPill(document.getElementById("conn"), !!health.sseConnected, health.sseConnected ? "SSE CONNECTED" : "SSE DISCONNECTED");
   document.getElementById("last").textContent = health.lastEventAt || "(none yet)";
@@ -405,6 +512,22 @@ async function refresh() {
       "<td class='mono'>" + esc(summarizeRaw(s.raw)) + "</td>";
     rows.prepend(tr);
   }
+
+  const opsRows = document.getElementById("opsRows");
+  opsRows.innerHTML = "";
+  (ops.sources || []).forEach((src) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td class='mono'>" + esc(src.source_system) + "</td>" +
+      "<td class='mono'>" + esc(src.last_packet_received || "(none)") + "</td>" +
+      "<td class='mono'>" + esc(src.packet_count || 0) + "</td>" +
+      "<td><span class='pill'>" + esc(src.last_ingest_status || "unknown") + "</span></td>" +
+      "<td class='mono'>" + esc(src.validation_errors || 0) + "</td>" +
+      "<td class='mono'>" + esc(src.new_signals_count || 0) + "</td>" +
+      "<td class='mono'>" + esc(src.contradictions_found || 0) + "</td>" +
+      "<td class='mono'>" + esc(src.promoted_to_memory_count || 0) + "</td>";
+    opsRows.appendChild(tr);
+  });
 }
 
 document.getElementById("refresh").addEventListener("click", () => refresh().catch(e => alert(e.message)));
@@ -454,7 +577,43 @@ function drainEventsToFile(reason) {
 }
 
 const server = app.listen(PORT, () => {
-  console.log("[bridge] listening on port " + PORT);
+  console.log("[lisa] listening on port " + PORT);
+  const watcher = startInboxWatcher({
+    enabled: INBOX_ENABLED,
+    inboxDir: INBOX_DIR,
+    archiveDir: INBOX_ARCHIVE_DIR,
+    failedDir: INBOX_FAILED_DIR,
+    pollMs: INBOX_POLL_MS,
+    onPacket: async (packet, meta) => {
+      const result = ingestPacket(packet);
+      recordEvent({
+        type: "ingest_file_packet",
+        file: {
+          name: meta.fileName,
+          path: meta.filePath,
+        },
+        packet,
+        ingestResult: {
+          ok: result.ok,
+          sourceSystem: result.sourceSystem,
+          errors: result.errors,
+          unknownFields: result.unknownFields,
+          contradictions: result.contradictions.length,
+          promoted: result.promoted,
+        },
+        signals: result.normalizedSignals,
+      });
+    },
+    onError: (err, meta) => {
+      recordEvent({
+        type: "ingest_file_error",
+        file: meta,
+        error: String(err?.message || err || "unknown file ingest error"),
+      });
+    },
+  });
+  stopInboxWatcher = watcher.stop;
+  getInboxWatcherStats = watcher.getStats;
   try {
     connectToV1();
   } catch (err) {
@@ -466,6 +625,7 @@ let shuttingDown = false;
 function shutdown(reason) {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopInboxWatcher();
   drainEventsToFile(reason);
   if (reconnectTimer) clearTimeout(reconnectTimer);
   server.close(() => {

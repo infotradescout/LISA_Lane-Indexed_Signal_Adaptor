@@ -1,7 +1,7 @@
 {
-  "name": "4data-stream-bridge",
+  "name": "lisa-lane-indexed-signal-adaptor",
   "version": "1.0.0",
-  "description": "",
+  "description": "LISA (Lane-Indexed Signal Adaptor) ingestion bridge",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

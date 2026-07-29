@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0.0",
+  "source_system": "newsfilter",
+  "source_system_version": "0.2.0",
+  "packet_type": "topic_event_packet",
+  "generated_at": "2026-04-14T23:00:00.000Z",
+  "lane": "trend_momentum",
+  "priority": "high",
+  "summary": "Event-driven macro update",
+  "items": [
+    {
+      "entity": "SPY",
+      "topic": "macro",
+      "category": "policy_event",
+      "summary": "Surprise policy signal supports risk assets",
+      "confidence": 0.74,
+      "novelty": 0.68,
+      "relevance": 0.83,
+      "severity": 0.52,
+      "evidence_refs": [
+        "https://example.com/source-a"
+      ]
+    }
+  ],
+  "evidence_refs": [
+    "https://example.com/source-b"
+  ],
+  "fresh_until": "2026-04-15T02:00:00.000Z",
+  "publish_status": "published"
+}
